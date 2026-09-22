@@ -11,6 +11,7 @@
 #include "82c711_fdc.h"
 #include "arc.h"
 #include "arm.h"
+#include "arm_core.h"
 #include "cmos.h"
 #include "config.h"
 #include "ddnoise.h"
@@ -327,6 +328,8 @@ void arc_set_cpu(int cpu, int memc)
 	ref8m_period = (arm_cpu_speed * 1024) / 8;
 	speed_mhz = arm_cpu_speed;
 	mem_updatetimings();
+	arm_core_select(arm_core_id);
+	rpclog("arc_setcpu : CPU core is %s\n", arm_core_name());
 }
 
 static int ddnoise_frames = 0;

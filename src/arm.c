@@ -163,7 +163,7 @@ static uint32_t pccache,*pccache2;
 #define countbits(c) countbitstable[c]
 static int countbitstable[65536];
 
-void resetarm()
+void arm_interp_reset(void)
 {
 	int c,d,exec;
 	for (c=0;c<65536;c++)
@@ -244,7 +244,7 @@ void resetarm()
 
 int indumpregs=0;
 
-void dumpregs()
+void arm_interp_dumpregs(void)
 {
 	int c;
 	FILE *f;
@@ -2142,7 +2142,7 @@ static const OpFn opcode_fns[256] =
 
 /*Execute ARM instructions for `cycs` clock ticks, typically 10 ms
   (cycs=80k for an 8MHz ARM2).*/
-void execarm(int cycles_to_execute)
+void arm_interp_exec(int cycles_to_execute)
 {
 	uint32_t templ,templ2;
 
@@ -2234,7 +2234,7 @@ void execarm(int cycles_to_execute)
 #ifndef RELEASE_BUILD
 		if ((armregs[15] & 3) != mode)
 		{
-			dumpregs();
+			arm_interp_dumpregs();
 			fatal("Mode mismatch\n");
 		}
 

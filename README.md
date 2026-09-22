@@ -17,6 +17,10 @@ What differs from upstream so far (branch `tarmac`):
 - **DebugSock** — the built-in debugger on a local socket so it can be
   scripted, plus an instruction trace for comparing two CPU cores. See
   [docs/DEBUGSOCK.md](docs/DEBUGSOCK.md).
+- **Selectable CPU core** — `arm.c` split into timing model and interpreter,
+  with the interpreter behind a run-time choice (`cpu_core` in the machine
+  configuration) so one binary can run either. See
+  [docs/ARM-CORES.md](docs/ARM-CORES.md).
 - `tools/arc-run.pl` (HostCmd client), `tools/armtest.ps1` (runs the
   `!ARMTest` ARM instruction-set soak test end to end and reports the FAIL
   count), `tools/arc-debug.pl` (debugger client), `tools/tracediff.pl`

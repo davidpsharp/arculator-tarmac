@@ -7,6 +7,7 @@
 #include "hostcmd.h"
 #include "debugsock.h"
 #include "arm.h"
+#include "arm_core.h"
 #include "config.h"
 #include "disc.h"
 #include "fpa.h"
@@ -725,6 +726,9 @@ void loadconfig()
 	p = (char *)config_get_string(CFG_MACHINE, NULL, "monitor_type", "multisync");
 	monitor_type = get_monitor_type(p);
 
+	p = (char *)config_get_string(CFG_MACHINE, NULL, "cpu_core", "arculator");
+	arm_core_select(p);
+
 	p = (char *)config_get_string(CFG_MACHINE, NULL, "joystick_if", "");
 	strcpy(joystick_if, p);
 	joystick_type = joystick_get_type(joystick_if);
@@ -854,6 +858,7 @@ void saveconfig()
 	config_set_int(CFG_MACHINE, NULL, "st506_present", st506_present);
 	config_set_string(CFG_MACHINE, NULL, "rom_set", config_get_romset_name(romset));
 	config_set_string(CFG_MACHINE, NULL, "monitor_type", get_monitor_type_name(monitor_type));
+	config_set_string(CFG_MACHINE, NULL, "cpu_core", arm_core_id);
 
 	config_set_string(CFG_MACHINE, NULL, "joystick_if", joystick_if);
 	for (c = 0; c < joystick_get_max_joysticks(joystick_type); c++)
