@@ -1,2 +1,26 @@
 .vscode
 
+
+# autotools / build output
+/autom4te.cache/
+/config.log
+/config.status
+/libtool
+/arculator.exe
+/arculator
+*.o
+*.lo
+*.la
+.deps/
+.libs/
+/src/arculator.exe
+/src/arculator
+/src/wx.res
+/podules/*/src/Makefile
+/podules/*/src/Makefile.in
+/podules/*/src/*.dll
+/podules/*/src/*.so
+
+# local build script output
+/build-mingw/
+/src/wx-resources.cc
