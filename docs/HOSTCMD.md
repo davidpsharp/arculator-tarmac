@@ -15,7 +15,8 @@ ported to Arculator and the guest half reused unchanged:
 | SWI dispatch | `src/arm.c` (`opSWI`), `ARCEM_SWI_HOSTCMD` = `&56AC5` in `src/hostfs.h` | same chunk as HostFS (`&56AC0`), sub-op in R9 |
 | Guest gateway module `RPCEmuSupport` 0.03 | `src/hostfs/rpcemusupport/` (source + binary), built into `roms/arcrom_ext` | RPCEmu-extended `riscos-progs/RPCEmuSupport`, binary identical to the 2.0.0 release |
 | Extension ROM builder | `tools/mkextrom.pl` | new; reproduces the shipped `arcrom_ext` byte for byte before the module was added |
-| Client | `rpcemu-run.exe` / `rpcemu-shell.exe` from an RPCEmu-extended release, with `--tcp` | unchanged |
+| Client | `tools/arc-run.pl` (Perl, core modules only); RPCEmu-extended's `rpcemu-run --tcp` also works | new |
+| Test harness | `tools/armtest.ps1` — launches a config, waits for the desktop, runs `!ARMTest`, saves the report, exits with the FAIL count | new |
 
 The module runs on RISC OS 3.11 / ARM3 (it is 26/32-bit neutral, ARMv3
 floor, no MRS/MSR). It announces itself over the SWI at boot, polls for
@@ -39,16 +40,22 @@ appear in every machine's file after its first run.
 ## Using it
 
 ```
-rpcemu-run.exe --tcp 127.0.0.1:15600 -- Modules
-rpcemu-run.exe --tcp 127.0.0.1:15600 -- "Set ARMTest$NoWait 1"
-rpcemu-run.exe --tcp 127.0.0.1:15600 -- "Run HostFS::HostFS.$.!ARMTest"
+perl tools/arc-run.pl -- Modules
+perl tools/arc-run.pl --quiet -- 'Set ARMTest$NoWait 1'
+perl tools/arc-run.pl --port 15600 --timeout 300 -- 'Run HostFS::HostFS.$.!ARMTest'
+
+# the whole acceptance loop: start the A5000 config, boot to the desktop, run
+# !ARMTest, save the report, quit; exit code = number of FAILs
+powershell -ExecutionPolicy Bypass -File tools\armtest.ps1 -RunDir C:\arculator-run -Config A5000 -Out reports\ARMReport.txt -Quit
 ```
 
 - One command at a time; the RISC OS session (CSD, system variables)
   persists between calls and across a guest reset.
-- The exit code of `rpcemu-run` is the guest's `Sys$ReturnCode`; `-1` means
-  the command never ran (no module, machine reset, or the module stopped
-  polling for 15 s).
+- The exit code of `arc-run.pl` is the guest's `Sys$ReturnCode` (a RISC OS
+  error gives 255); 255 also if the command never ran (no module, machine
+  reset, or the module stopped polling for 15 s), 254 if the emulator could
+  not be reached. `--wait` blocks until the port answers, for scripts that
+  have just launched the emulator.
 - No stdin: commands that prompt will hang until the client's timeout. Use
   `BASIC -quit <file>`, `Obey` files, etc.
 - Commands that need an application slot (`WimpSlot`, `BASIC`) work once the

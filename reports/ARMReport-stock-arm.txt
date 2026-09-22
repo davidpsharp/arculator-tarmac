@@ -1,0 +1,261 @@
+Tarmac ARM2/ARM3 instruction set soak test v0.0.1
+Report written Tue,22 Sep 1992.10:52:27
+
+Legend: PASS/FAIL against ARM2/ARM3 data sheet behaviour; OBSERVE = recorded, not judged
+Machine: RISC OS 3.11 (29 Sep 1992)
+Note: on ARM6 and later some ARM2/ARM3 behaviours differ by design and will show as FAIL here:
+      STR/STM of R15 may store PC+8 rather than PC+12 (StrongARM); aborts restore the base register
+      instead of updating it; with 32 bit data addressing (RISC OS 3.5+) there are no address exceptions;
+      ARMv4 (StrongARM) leaves R15 with a register-specified shift unpredictable
+Unmapped address used for abort tests: &02100000
+Processor: ARM3 (ID &41560300, revision 0)
+Harness code at &00018B7C, test slot 0 at &00018B90
+
+=== 0. Harness self test ===
+PASS    MOV R0,#1 through harness = &00000001
+PASS    MVN R0,#0 gives &FFFFFFFF = &FFFFFFFF
+
+=== 1. Condition codes (16 conditions x 16 flag states) ===
+PASS    MOVEQ correct for all 16 flag states
+PASS    MOVNE correct for all 16 flag states
+PASS    MOVCS correct for all 16 flag states
+PASS    MOVCC correct for all 16 flag states
+PASS    MOVMI correct for all 16 flag states
+PASS    MOVPL correct for all 16 flag states
+PASS    MOVVS correct for all 16 flag states
+PASS    MOVVC correct for all 16 flag states
+PASS    MOVHI correct for all 16 flag states
+PASS    MOVLS correct for all 16 flag states
+PASS    MOVGE correct for all 16 flag states
+PASS    MOVLT correct for all 16 flag states
+PASS    MOVGT correct for all 16 flag states
+PASS    MOVLE correct for all 16 flag states
+PASS    MOVAL correct for all 16 flag states
+PASS    MOVNV correct for all 16 flag states
+
+=== 2. Data processing: results and NZCV against reference model ===
+PASS    224 data processing vectors (result and NZCV) all correct
+PASS    ADD R0,R0,R0 (all three the same register) = &2468ACF0
+PASS    SUBS R0,R0,R0 result = &00000000
+PASS    SUBS R0,R0,R0 flags (Z and C set) NZCV=nZCv
+PASS    ADD (no S bit) preserves NZCV NZCV=nZcV
+
+=== 3. Barrel shifter: immediate and register shift amounts ===
+FAIL    MOVS R2,R1,ROR R3 (R3=32) R1=&00000001 Cin=1 flags expected nzcV got nzCV
+FAIL    MOVS R2,R1,ROR R3 (R3=64) R1=&80000001 Cin=0 flags expected NzCV got NzcV
+        2 failures in 76 vectors
+PASS    ADDS R2,R0,R1,LSL #1 result (1 + 0) = &00000001
+PASS    ADDS R2,R0,R1,LSL #1: C comes from the adder, not the shifter NZCV=nzcv
+PASS    ADDS R2,R0,R1,LSL #1 with Cin=1: adder clears C, Z set NZCV=nZcv
+
+=== 4. Immediate operands (8 bit value rotated right by 2*rot) ===
+PASS    MOVS R0,#1 = &00000001
+PASS    MOVS R0,#1 (rotate 0) leaves C set NZCV=nzCv
+PASS    MOVS R0,#1 (rotate 0) leaves C clear NZCV=nzcv
+PASS    MOVS R0,#&FF (rotate 0) leaves C set NZCV=nzCv
+PASS    MOVS R0,#&80000000 (2 ROR 2) = &80000000
+PASS    MOVS R0,#&80000000: C = bit 31 of the rotated value (1) NZCV=NzCv
+PASS    MOVS R0,#&40000000 (1 ROR 2) = &40000000
+PASS    MOVS R0,#&40000000: C = bit 31 of the rotated value (0) NZCV=nzcv
+PASS    MOVS R0,#&FF000000 (&FF ROR 8) = &FF000000
+PASS    MOVS R0,#&FF000000: N and C NZCV=NzCv
+PASS    MOVS R0,#&1000 (&10 ROR 24) = &00001000
+PASS    MOVS R0,#&1000: rotated, C = bit 31 = 0 NZCV=nzcv
+PASS    MOVS R0,#0 sets Z, keeps C NZCV=nZCv
+PASS    ADDS R0,R0,#1 wraps to 0 = &00000000
+PASS    ADDS &FFFFFFFF+1: Z and C NZCV=nZCv
+PASS    SUBS &80000000-1 = &7FFFFFFF
+PASS    SUBS &80000000-1: C (no borrow) and V NZCV=nzCV
+PASS    SUBS 0-1: N set, C clear (borrow), V clear NZCV=Nzcv
+PASS    RSBS R0,R0,#0 with R0=0: Z and C NZCV=nZCv
+PASS    CMP R0,#5 equal: Z,C set, V cleared by the compare NZCV=nZCv
+PASS    CMN R0,#5 (5+5) NZCV=nzcv
+PASS    CMN &FFFFFFFB,#5 gives zero: Z and C NZCV=nZCv
+PASS    TST &F0,#&0F: Z set, C and V untouched NZCV=nZCV
+PASS    TEQ &F0,#&F0: Z set NZCV=nZcv
+
+=== 5. R15 (PC+PSR) as an operand ===
+PASS    MOV R0,PC: Rm gives PC+8 with PSR (NZCV=NccV) = &90018B98
+PASS    ADD R0,PC,#0: Rn gives PC+8 without PSR = &00018B98
+FAIL    MOV R0,PC,LSL R1 (R1=0): Rm with register shift gives PC+12 with PSR expected &90018B9C got &90018B98
+FAIL    ADD R0,PC,R1,LSL R2: Rn with register shift gives PC+12 without PSR expected &00018B9C got &00018B98
+PASS    MOV R0,R1,LSL PC (R1=1): Rs is PC+8 without PSR, bottom byte (152) used = &00000000
+PASS    TST PC,#3 in user mode: mode bits 00 so Z set NZCV=nZcv
+PASS    MOV PC,PC skips the next instruction: R0 untouched = &00000000
+PASS    MOV PC,PC skips the next instruction: R1 executed = &00000001
+PASS    ADD PC,PC,#0 skips the next instruction (R0,R1 as bits) = &00000002
+PASS    MOV PC,PC (no S) in user mode leaves NZCV alone NZCV=NZCV
+
+=== 6. LDR/STR addressing modes, alignment and register overlap ===
+PASS    LDR R0,[R1,#8] = &11000008
+PASS    LDR R0,[R1,#8] leaves base = &0001CEAC
+PASS    LDR R0,[R1,#-8] = &1100FFF8
+PASS    LDR R0,[R1,#12]! value = &1100000C
+PASS    LDR R0,[R1,#12]! writeback = &0001CEB8
+PASS    LDR R0,[R1],#12 loads from base = &11000000
+PASS    LDR R0,[R1],#12 post-increments = &0001CEB8
+PASS    LDR R0,[R1],#-12 post-decrements = &0001CEA0
+PASS    LDR R0,[R1,R2,LSL #2] (R2=2) = &11000008
+PASS    LDR R0,[R1,-R2] (R2=8) = &1100FFF8
+PASS    LDR R0,[R1,R2,LSR #2] (R2=32) = &11000008
+PASS    LDR R0,[R1,R2,ASR #1] (R2=-16) = &1100FFF8
+PASS    LDR R0,[R1,R2,ROR #1] (R2=&10) = &11000008
+PASS    LDR R0,[R1],R2 post-indexed writeback = &0001CEB4
+PASS    STR R0,[R1,#4] = &CAFE0001
+PASS    STR R0,[R1],#4 stores at base = &CAFE0002
+PASS    STR R0,[R1],#4 writeback = &0001CEB0
+PASS    LDRB R0,[R1] from odd address gives that byte only = &00000022
+PASS    STRB R0,[R1] writes low byte only = &44AA2211
+PASS    LDR from address+1 rotates the aligned word right by 8 = &11443322
+PASS    LDR from address+2 rotates right by 16 = &22114433
+PASS    LDR from address+3 rotates right by 24 = &33221144
+PASS    STR to address+3 stores to the aligned word, unrotated = &AABBCCDD
+PASS    LDR R0,[R0],#4: loaded value wins over writeback = &55667788
+PASS    LDR R0,[R0,#4]!: loaded value wins over writeback = &CAFE0001
+PASS    STR R0,[R0],#4 stores the original R0 = &0001CEAC
+PASS    STR R0,[R0],#4 then writes back = &0001CEB0
+PASS    STR PC,[R1] stores PC+12 with PSR = &50018B9C
+PASS    LDR PC,[R1] jumps (R0,R2 as bits: skipped, executed) = &00000002
+PASS    LDR PC,[R1] in user mode: flags kept NZCV=NzCv
+PASS    LDR R0,[PC,#4] reads from PC+8+4 (slot 3) = &E3A050AB
+
+=== 7. LDM/STM: modes, writeback, base in list, R15 ===
+PASS    STMIA R4!,{R0-R3} word 0 = &000000A0
+PASS    STMIA R4!,{R0-R3} word 3 = &000000A3
+PASS    STMIA R4!,{R0-R3} writeback +16 = &0001D1BC
+PASS    STMIB R4!,{R0-R3} first word at base+4 = &000000B0
+PASS    STMIB R4!,{R0-R3} last word at base+16 = &000000B3
+PASS    STMIB writeback +16 = &0001D1BC
+PASS    STMDA R4!,{R0-R3} last word at base = &000000C3
+PASS    STMDA R4!,{R0-R3} first word at base-12 = &000000C0
+PASS    STMDA writeback -16 = &0001D19C
+PASS    STMDB R4!,{R0-R3} last word at base-4 = &000000D3
+PASS    STMDB R4!,{R0-R3} first word at base-16 = &000000D0
+PASS    STMDB writeback -16 = &0001D19C
+PASS    LDMIA R4!,{R0-R3} R0 = &000000E0
+PASS    LDMIA R4!,{R0-R3} R3 = &000000E3
+PASS    LDMIA writeback = &0001D1BC
+PASS    LDMDB R4!,{R0-R3} from base-16: R0 = &000000E0
+PASS    LDMDB R4!,{R0-R3} R3 = &000000E3
+PASS    LDMDB writeback = &0001D1AC
+PASS    LDMIA R4,{R1,R3} R1 from base = &000000E0
+PASS    LDMIA R4,{R1,R3} R3 from base+4 = &000000E1
+PASS    LDMIA without ! leaves base = &0001D1AC
+PASS    STMIA R0!,{R0-R2}: base first in list stores the ORIGINAL base = &0001D1AC
+PASS    STMIA R0!,{R0-R2}: writeback = &0001D1B8
+OBSERVE STMIA R1!,{R0-R2}: base not first in list stores &0001D1B8 (original &0001D1AC, written back &0001D1B8); ARM2/3 store the written-back value
+PASS    LDMIA R0!,{R0-R2}: loaded value wins over writeback = &000000E0
+PASS    LDMIA R0!,{R0-R2}: other registers loaded = &000000E2
+PASS    STMIA R1,{PC} stores PC+12 with PSR = &50018B9C
+PASS    STMIA R1,{R0,PC}: R0 first = &00000000
+PASS    STMIA R1,{R0,PC}: PC+12 with PSR second = &50018B9C
+PASS    LDMIA R1,{PC} jumps (R0,R2 as bits) = &00000002
+PASS    LDMIA R1,{PC} without ^ in user mode leaves NZCV NZCV=NzCv
+PASS    LDMIA R1,{PC}^ jumps = &00000002
+PASS    LDMIA R1,{PC}^ in user mode restores NZCV from the loaded word NZCV=NZCV
+
+=== 8. MUL/MLA (low 32 bits, N and Z) ===
+PASS    12 multiply vectors (MULS and MLAS) all correct
+OBSERVE MULS C flag afterwards (data sheet: meaningless) = 1
+OBSERVE MUL R0,R0,R1 with Rd=Rm (data sheet: undefined) gives &00000000
+
+=== 9. SWP/SWPB (ARM3) ===
+PASS    SWP R0,R1,[R2] loads old memory = &0BADF00D
+PASS    SWP R0,R1,[R2] stores R1 = &12345678
+PASS    SWP leaves Rm = &12345678
+PASS    SWP R0,R0,[R2] (Rd=Rm) loads memory = &0BADF00D
+PASS    SWP R0,R0,[R2] stores the old R0 = &AAAAAAAA
+PASS    SWPB R0,R1,[R2] loads a byte = &00000011
+PASS    SWPB R0,R1,[R2] stores the low byte = &44332299
+OBSERVE SWP from address+2: loaded &44332211 (LDR would give &22114433), stored &DDCCBBAA
+
+=== 10. B and BL ===
+PASS    B +8 skips one instruction (R0,R1 as bits) = &00000002
+PASS    BL +8 skips one instruction = &00000002
+PASS    BL sets R14 = address of the next instruction with PSR = &90018B94
+PASS    Backward BNE loop (ADDS/CMP/BNE) runs three times = &00000003
+PASS    BLEQ not taken (Z clear) executes the next instruction = &00000001
+PASS    MOVS PC,R1 jumps to the address in R1 = &00000002
+PASS    MOVS PC,R1 in user mode sets NZCV from R1 NZCV=NZCV
+PASS    MOVS PC,R1 with mode/I/F bits set in user mode: still jumps = &00000002
+PASS      and the mode stays user, I/F clear = &00000000
+PASS      and NZCV cleared as R1 asked NZCV=nzcv
+
+=== 11. TEQP/TSTP/CMPP in user mode ===
+PASS    TEQP PC,#&F0000000 sets all of NZCV NZCV=NZCV
+PASS    TEQP PC,#0 clears NZCV NZCV=nzcv
+PASS    TEQP PC,#3 in user mode cannot change mode = &00000000
+PASS    TEQP PC,#&0C000000 in user mode cannot set I or F = &00000000
+PASS    TSTP PC,R0 (R0=&A0000000): Rn=PC has no PSR bits so the AND is 0 and NZCV all clear NZCV=nzcv
+OBSERVE CMPP PC,R0 (R0=1) sets NZCV from (PC+8)-1: nzcv
+PASS    TSTP PC,#0 clears NZCV NZCV=nzcv
+PASS    TSTP PC,#0 executes as one instruction (next instruction ran, R0 untouched) = &12345679
+PASS    MOVS R0,R1,LSL R2 with R2=0 and C clear: C stays clear NZCV=nzcv
+PASS    MOVS R0,R1,ROR R2 with R2=0 and C set: C stays set NZCV=nzCv
+
+=== 12. Processor modes, banked registers, TEQP and MOVS PC in privileged modes ===
+PASS    After OS_EnterOS + TEQP: mode bits = SVC (3) = &00000003
+PASS    SVC: I and F set by TEQP PC,#&0C000003 = &0C000000
+PASS    TEQP into IRQ mode: mode bits = 2 = &00000002
+PASS    TEQP into FIQ mode: mode bits = 1 = &00000001
+PASS    TEQP back to SVC: mode bits = 3 = &00000003
+PASS    IRQ R13 (&01F0136C) is banked separately from user R13 (&00057F8C)
+PASS    IRQ R13 written in IRQ mode survives a visit to FIQ mode = &22000000
+PASS    FIQ R8 written in FIQ mode survives a visit to IRQ mode = &44000000
+PASS    FIQ R8 (&44000000) does not disturb SVC/user R8 = &11000000
+PASS    STM ^ in SVC stores USER R13 = &00057F8C
+PASS    STM ^ in SVC stores USER R14 (BASIC return address, PSR stripped) = &038B9F48
+PASS    TEQP PC,#0 from SVC returns to user; TEQP PC,#&0C000003 from user then does nothing = &00000000
+PASS    MOVS PC,R14 from user mode returned to BASIC (flags NZCV=nzcv before it)
+PASS    In SVC after OS_EnterOS (mode bits) = &00000003
+PASS    XOS SWI &FFFFF (unknown) from SVC returns with V set = &00000001
+PASS    Unknown SWI returns in SVC = &00000003
+PASS    Unknown SWI returned an error pointer in R0 (&01800ECC)
+
+=== 13. Exceptions: undefined instruction, data abort, address exception, prefetch abort ===
+PASS    Undefined instruction (&E6000010): handler entered exactly once = &00000001
+PASS    Undefined instruction: via handler 1 (undefined instruction) = &00000001
+PASS    Undefined: handler R14 = instruction+4 = &00018D74
+PASS    Undefined: R14 carries user mode bits and the flags (Z,C) = &60000000
+PASS    Undefined: handler runs in SVC mode with I set = &08000003
+PASS    Undefined: F flag not set on entry = &00000000
+PASS    Undefined: user R0 seen by handler = &AAAA0000
+PASS    Undefined: user R3 seen by handler = &AAAA0003
+PASS    Undefined: the instruction after it was skipped (R4 still 0) = &00000000
+PASS    Data abort (LDR R0,[R1],#4 from an unmapped address in user mode): handler entered once = &00000001
+PASS    Data abort: via handler 3 (data abort) = &00000003
+PASS    Data abort: handler R14 = instruction+8 = &00018DAC
+PASS    Data abort: R14 flags/mode = user, Z,C = &60000000
+PASS    Data abort: handler in SVC with I set = &08000003
+PASS    Data abort: destination R0 not written = &BBBB0000
+OBSERVE Data abort: post-indexed base after abort = &02100000 (ARM2/ARM3 update the base; ARM6 and later restore it)
+PASS    Data abort: following instruction skipped = &00000000
+PASS    Data abort in LDMIA R1!,{R2,R3}: handler entered once = &00000001
+PASS    LDM abort: R14 = instruction+8 = &00018DE0
+OBSERVE LDM abort: afterwards R1 (base) = &02100008, R2 = &CCCC0002, R3 = &CCCC0003 (ARM2/3: base written back, destination registers unchanged)
+PASS    Address exception (LDR from &4000000): handler entered once = &00000001
+PASS    Address exception: via handler 4 (address exception, not data abort) = &00000004
+PASS    Address exception: R14 = instruction+8, as for data abort (Arculator 2.2 agrees) = &00018E14
+PASS    Address exception: SVC with I set = &08000003
+PASS    Address exception: R0 not written = &DDDD0000
+PASS    Address exception: following instruction skipped = &00000000
+PASS    Address exception for &FFFFFFFC (all bits above 26 set): handler entered once = &00000001
+PASS    Address exception for &FFFFFFFC: via handler 4 = &00000004
+PASS    Prefetch abort (MOV PC,R1 to an unmapped address in user mode): handler entered once = &00000001
+PASS    Prefetch abort: via handler 2 (prefetch abort) = &00000002
+PASS    Prefetch abort: R14 = aborting address+4 = &02100004
+PASS    Prefetch abort: R14 flags/mode = user, Z,C = &60000000
+PASS    Prefetch abort: SVC with I set = &08000003
+
+=== 14. Self referential and pipeline edge cases ===
+FAIL    LDR R0,[PC],#8 loads the word at PC+8 (slot 2) expected &E3A02001 got &00000000
+OBSERVE LDR R0,[PC],#8 writes PC+16 back to PC: slots 1,2,3 executed = 0,0,0 (0,0,0 if the writeback took effect)
+PASS    ADD R0,PC,PC = (PC+8 without PSR) + (PC+8 with PSR) = &50031730
+PASS    MOV R1,PC with all flags clear in user mode = slot0+8 exactly = &00018B98
+PASS    NV condition: MOVNV/LDRNV/BNV/LDMNV all not executed = &00000000
+PASS    SUB PC,PC,#0 (= MOV PC,PC) skips the next instruction = &00000002
+
+=== Summary ===
+PASS    200
+FAIL    5
+OBSERVE 8
