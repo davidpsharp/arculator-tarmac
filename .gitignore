@@ -1,26 +1,43 @@
-.vscode
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
+# CMake
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CMakeUserPresets.json
+compile_commands.json
 
-# autotools / build output
-/autom4te.cache/
-/config.log
-/config.status
-/libtool
-/arculator.exe
-/arculator
+# Build artifacts
 *.o
-*.lo
-*.la
-.deps/
-.libs/
-/src/arculator.exe
-/src/arculator
-/src/wx.res
-/podules/*/src/Makefile
-/podules/*/src/Makefile.in
-/podules/*/src/*.dll
-/podules/*/src/*.so
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
 
-# local build script output
-/build-mingw/
-/src/wx-resources.cc
+# Generated files
+wx-resources.cc
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# Dependencies fetched by CMake
+_deps/
+
+# Arculator executable
+arculator
+install/
+roms/
+!roms/arcrom_ext
+!roms/*/roms.txt

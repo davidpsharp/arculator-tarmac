@@ -140,7 +140,6 @@ private:
 #endif
 
 	void Quit(bool stop_emulator = 1);
-	void ChangeDisc(int drive);
 
 	wxDECLARE_EVENT_TABLE();
 };

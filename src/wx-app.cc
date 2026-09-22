@@ -85,7 +85,7 @@ void *main_menu = NULL;
 
 static wxMenuItem *find_item(int id)
 {
-#ifdef UI_WX
+#if defined(UI_WX) || defined(__APPLE__)
 	return ((wxMenuBar *)main_menu)->FindItem(id);
 #else
 	return ((wxMenu *)main_menu)->FindItem(id);
@@ -104,6 +104,24 @@ Frame::Frame(App* app, const wxString& title, const wxPoint& pos,
 #else
 	this->menu = wxXmlResource::Get()->LoadMenu(wxT("main_menu"));
 	main_menu = this->menu;
+#endif
+
+#if defined(__APPLE__) && !defined(UI_WX)
+	/* Present the existing popup menu as a native macOS menu bar. */
+	wxMenuBar *menu_bar = new wxMenuBar();
+	while (this->menu->GetMenuItemCount() > 0)
+	{
+		wxMenuItem *item = this->menu->FindItemByPosition(0);
+		if (!item->IsSubMenu())
+			break;
+
+		wxMenu *sub_menu = item->GetSubMenu();
+		wxString label = item->GetItemLabelText();
+		this->menu->Remove(item);
+		menu_bar->Append(sub_menu, label);
+	}
+	SetMenuBar(menu_bar);
+	main_menu = menu_bar;
 #endif
 
 	Bind(wxEVT_MENU, &Frame::OnMenuCommand, this);
@@ -126,7 +144,13 @@ Frame::~Frame()
 void Frame::Start()
 {
 	if (strlen(machine_config_name) != 0 || !ShowConfigSelection())
+	{
 		arc_start_main_thread(this, this->menu);
+#if defined(__APPLE__) && !defined(UI_WX)
+		/* The SDL loop runs on the macOS main thread and returns on quit. */
+		Quit(0);
+#endif
+	}
 	else
 		Quit(0);
 }
@@ -235,12 +259,17 @@ void Frame::UpdateMenu()
 
 void Frame::OnPopupMenuEvent(PopupMenuEvent &event)
 {
+#if defined(__APPLE__) && !defined(UI_WX)
+	/* The menu is already visible in the native system menu bar. */
+	UpdateMenu();
+#else
 	wxWindow *window = event.GetWindow();
 	wxMenu *menu = event.GetMenu();
 
 	UpdateMenu();
 
 	window->PopupMenu(menu);
+#endif
 }
 
 static void ChangeDisc(int drive)
@@ -600,11 +629,20 @@ void Frame::OnMenuCommand(wxCommandEvent &event)
 	OnMenuCommandCommon(event, this);
 }
 
+#if defined(__APPLE__) && !defined(UI_WX)
+extern "C" volatile int quited;
+#endif
+
 extern "C" void arc_stop_emulation()
 {
+#if defined(__APPLE__) && !defined(UI_WX)
+	/* wx events cannot run while the SDL loop owns the macOS main thread. */
+	quited = 1;
+#else
 	wxCommandEvent* event = new wxCommandEvent(WX_STOP_EMULATION_EVENT, wxID_ANY);
 	event->SetEventObject((wxWindow*)main_frame);
 	wxQueueEvent((wxWindow*)main_frame, event);
+#endif
 }
 
 extern "C" void arc_popup_menu()
