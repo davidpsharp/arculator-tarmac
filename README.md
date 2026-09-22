@@ -14,9 +14,14 @@ What differs from upstream so far (branch `tarmac`):
 - **HostCmd** — run RISC OS `*commands` from the host over a local socket and
   read back their output and return code; ported from RPCEmu-extended. See
   [docs/HOSTCMD.md](docs/HOSTCMD.md).
+- **DebugSock** — the built-in debugger on a local socket so it can be
+  scripted, plus an instruction trace for comparing two CPU cores. See
+  [docs/DEBUGSOCK.md](docs/DEBUGSOCK.md).
 - `tools/arc-run.pl` (HostCmd client), `tools/armtest.ps1` (runs the
   `!ARMTest` ARM instruction-set soak test end to end and reports the FAIL
-  count), `tools/mkextrom.pl` (rebuilds `roms/arcrom_ext`).
+  count), `tools/arc-debug.pl` (debugger client), `tools/tracediff.pl`
+  (finds where two instruction traces diverge), `tools/mkextrom.pl`
+  (rebuilds `roms/arcrom_ext`).
 - The RPCEmuSupport guest module added to the Arculator support extension ROM.
 
 The Tarmac core itself is not in yet. This fork is developed with AI

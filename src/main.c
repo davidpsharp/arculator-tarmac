@@ -47,6 +47,7 @@
 
 #include "hostfs.h"
 #include "hostcmd.h"
+#include "debugsock.h"
 
 /*0=Arthur
   1=RiscOS 2
@@ -165,6 +166,7 @@ int arc_init()
 #endif
 	hostfs_init();
 	hostcmd_init();
+	debugsock_init();
 	initmem(memsize);
 
 	if (loadrom())
@@ -337,6 +339,7 @@ void arc_run()
 	if (mousehack) doosmouse();
 	execarm((speed_mhz * 1000000) / 100);
 	hostcmd_poll();
+	debugsock_poll();
 	frameco++;
 	ddnoise_frames++;
 	if (ddnoise_frames == 10)
@@ -362,6 +365,7 @@ void arc_close()
 	cmos_save();
 	saveconfig();
 	hostcmd_close();
+	debugsock_close();
 	podules_close();
 	disc_close(0);
 	disc_close(1);

@@ -24,6 +24,11 @@ void debug_writememl(uint32_t a, uint32_t v);
 void debugger_start_reset(void);
 void debugger_end_reset(void);
 
+/* Instruction trace, driven by the debugger's "trace" command. Tested once
+   per instruction inside execarm()'s existing "if (debugon)". */
+extern int debug_trace_active;
+void debug_trace_instruction(uint32_t pc, uint32_t opcode);
+
 extern int debug, debugon;
 extern int debugger_in_reset;
 extern int indebug;

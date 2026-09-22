@@ -2669,7 +2669,11 @@ void execarm(int cycles_to_execute)
 		if (!prefabort)
 		{
 			if (debugon)
+			{
 				debugger_do();
+				if (debug_trace_active)
+					debug_trace_instruction((PC - 8) & 0x3fffffc, opcode);
+			}
 
 			if (flaglookup[opcode >> 28][armregs[15] >> 28])
 				opcode_fns[(opcode >> 20) & 0xff](opcode);

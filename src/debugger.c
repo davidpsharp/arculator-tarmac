@@ -1,8 +1,11 @@
+#include <stdio.h>
 #include <string.h>
+#include <SDL.h>
 #include "arc.h"
 #include "arm.h"
 #include "debugger.h"
 #include "debugger_swis.h"
+#include "debugsock.h"
 #include "ioc.h"
 #include "mem.h"
 #include "memc.h"
@@ -25,6 +28,34 @@ void debug_out(char *s)
 {
 	rpclog("%s", s);
 	console_output(s);
+	debugsock_output(s);
+}
+
+/*
+ * Read the next debugger command.
+ *
+ * A socket client takes precedence over the console window, so that a script
+ * driving the debugger is not fighting with a window that may not even be
+ * open - console_input_get() reports the window closed straight away, which
+ * would switch the debugger off under a client's feet.
+ */
+static int debugger_input_get(char *s)
+{
+	if (debugsock_connected())
+	{
+		while (1)
+		{
+			if (debugger_in_reset)
+				return CONSOLE_INPUT_GET_ERROR_IN_RESET;
+			if (debugsock_input_get(s))
+				return (int)strlen(s);
+			if (!debugsock_connected())
+				break;	/* client went away: fall back to the console */
+			SDL_Delay(10);
+		}
+	}
+
+	return console_input_get(s);
 }
 
 
@@ -42,6 +73,64 @@ static int32_t write_breakpoints[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 static int32_t write_watchpoints[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 static int debug_step_count = 0;
 static uint32_t debug_trap_enable = 0;
+
+/*
+ * Instruction trace.
+ *
+ * One line per executed instruction: the address, the opcode and the whole
+ * register file before it runs. The point is comparing two CPU cores running
+ * the same software - the first line that differs is the instruction where
+ * they part company - so the format is fixed, and anything that would differ
+ * between runs of the same core (timing, cycle counts) is deliberately left
+ * out. tools/tracediff.pl reads it.
+ *
+ * debug_trace_active is tested once per instruction inside the existing
+ * "if (debugon)" in execarm(), so a machine running without the debugger
+ * pays nothing for this.
+ */
+int debug_trace_active = 0;
+static FILE *debug_trace_file = NULL;
+static uint64_t debug_trace_remaining = 0;
+static uint64_t debug_trace_written = 0;
+
+static void debug_trace_stop(void)
+{
+	if (debug_trace_file)
+	{
+		fclose(debug_trace_file);
+		debug_trace_file = NULL;
+	}
+	debug_trace_active = 0;
+	debug_trace_remaining = 0;
+}
+
+void debug_trace_instruction(uint32_t pc, uint32_t opcode)
+{
+	if (!debug_trace_file)
+	{
+		debug_trace_active = 0;
+		return;
+	}
+
+	fprintf(debug_trace_file,
+		"%07X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X\n",
+		pc, opcode,
+		armregs[0], armregs[1], armregs[2], armregs[3],
+		armregs[4], armregs[5], armregs[6], armregs[7],
+		armregs[8], armregs[9], armregs[10], armregs[11],
+		armregs[12], armregs[13], armregs[14], armregs[15]);
+
+	debug_trace_written++;
+	if (debug_trace_remaining && --debug_trace_remaining == 0)
+	{
+		char s[128];
+
+		sprintf(s, "    Trace limit reached after %llu instructions\n",
+			(unsigned long long)debug_trace_written);
+		debug_trace_stop();
+		debug_out(s);
+	}
+}
 
 #define RD ((opcode>>12)&0xF)
 #define RN ((opcode>>16)&0xF)
@@ -547,7 +636,7 @@ void debugger_do()
 		debug_disaddr = d;
 		debug_out("\n");
 
-		ret = console_input_get(ins);
+		ret = debugger_input_get(ins);
 		if (ret == CONSOLE_INPUT_GET_ERROR_WINDOW_CLOSED) /*Debugger console has been closed*/
 		{
 			debug = 0;
@@ -794,6 +883,45 @@ void debugger_do()
 			}
 			break;
 			case 't': case 'T':
+			if (!strncasecmp(command, "trace", 5))
+			{
+				/* trace <file> [n] | trace off */
+				if (!params || !strncasecmp(param1, "off", 3))
+				{
+					if (debug_trace_file)
+					{
+						sprintf(outs, "    Trace stopped after %llu instructions\n",
+							(unsigned long long)debug_trace_written);
+						debug_trace_stop();
+					}
+					else
+						strcpy(outs, "    Not tracing\n");
+					debug_out(outs);
+					break;
+				}
+
+				debug_trace_stop();
+				debug_trace_file = fopen(param1, "wt");
+				if (!debug_trace_file)
+				{
+					sprintf(outs, "    Could not open %s for writing\n", param1);
+					debug_out(outs);
+					break;
+				}
+				debug_trace_written = 0;
+				debug_trace_remaining = 0;
+				if (params > 1)
+					sscanf(param2, "%llu", (unsigned long long *)&debug_trace_remaining);
+				/* A trace of a booting machine is millions of lines, so
+				   default to a limit rather than filling the disc. */
+				if (!debug_trace_remaining)
+					debug_trace_remaining = 1000000;
+				debug_trace_active = 1;
+				sprintf(outs, "    Tracing to %s, limit %llu instructions\n",
+					param1, (unsigned long long)debug_trace_remaining);
+				debug_out(outs);
+				break;
+			}
 			if (!params)
 			{
 				sprintf(outs, "Trap status :\n"
@@ -929,6 +1057,8 @@ void debugger_do()
 			debug_out("    save <fn> <addr> <size> - save memory area to disc\n");
 			debug_out("    t disable <type>        - disable trap\n");
 			debug_out("    t enable <type>         - enable trap\n");
+			debug_out("    trace <file> [n]        - trace instructions to file (limit n, default 1000000)\n");
+			debug_out("    trace off               - stop tracing\n");
 			debug_out("                              Available traps are prefabort, dataabort, addrexcep,\n");
 			debug_out("                              undefins and swi\n");
 			debug_out("    watchw <addr>           - set a write watchpoint at addr\n");

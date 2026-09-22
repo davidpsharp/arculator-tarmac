@@ -29,6 +29,7 @@ set(ARCULATOR_SOURCES
     g332.c
     hostfs.c
     hostcmd.c
+    debugsock.c
     ide.c
     ide_a3in.c
     ide_config.c
