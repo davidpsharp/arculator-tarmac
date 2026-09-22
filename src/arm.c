@@ -10,6 +10,7 @@
 #include "disc.h"
 #include "fpa.h"
 #include "hostfs.h"
+#include "hostcmd.h"
 #include "ide.h"
 #include "ioc.h"
 #include "keyboard.h"
@@ -2564,6 +2565,16 @@ static void opSWI(uint32_t opcode)
 		uint32_t templ = memmode;
 		memmode = MEMMODE_SUPER;
 		hostfs(&state);
+		memmode = templ;
+	}
+	else if ((opcode & 0xdffff) == ARCEM_SWI_HOSTCMD)
+	{
+		ARMul_State state;
+
+		state.Reg = armregs;
+		uint32_t templ = memmode;
+		memmode = MEMMODE_SUPER;
+		hostcmd(&state);
 		memmode = templ;
 	}
 	else if ((opcode&0xFFFF)==0x1C && mousehack)

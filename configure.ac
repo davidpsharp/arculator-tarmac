@@ -113,6 +113,7 @@ case "$host" in
        ;;
     *-*-cygwin* | *-*-mingw32*)
        build_win="yes"
+       LIBS="$LIBS -lws2_32"
        AC_SUBST(SET_MAKE, 'MAKE=mingw32-make')
        ;;
     *-*-linux*)

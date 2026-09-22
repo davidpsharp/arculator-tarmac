@@ -1,0 +1,1046 @@
+/*
+  Arculator - Acorn Archimedes emulator
+
+  HostCmd - expose the guest RISC OS command line to the host.
+
+  Ported from RPCEmu-extended (src/hostcmd.c, Andy Timmins) for the
+  arculator-tarmac fork. The SWI protocol and the wire protocol are
+  unchanged so RPCEmu's rpcemusupport module and rpcemu-run client work
+  as they are; only the configuration, logging and lifecycle glue differ.
+
+  This file is the emulator (host) half of HostCmd: a small local socket
+  server plus the SWI handler the guest gateway module talks to. Both the SWI
+  handler (hostcmd) and the socket service (hostcmd_poll) run on the emulator
+  thread, so the shared state below needs no locking.
+
+  Wire protocol (see docs): the client sends a command as one '\n'-terminated
+  line; the server streams back length-prefixed frames [type:1][len:u32 BE]
+  [payload], where type is 'O' (output chunk), 'D' (done; payload = 4-byte BE
+  return code) or 'X' (advisory text).
+
+  Copyright (C) 2025-2026 Andy Timmins
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version.
+ */
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>	/* clock_gettime, for the queued-command timeouts */
+
+#include "socket-compat.h"
+#include "arc.h"
+#include "config.h"
+#include "hostcmd.h"
+
+/* Default control-socket port. Arculator uses TCP loopback on every platform:
+   one configuration key (hostcmd_port) instead of RPCEmu's path-or-port rules.
+   15590 is RPCEmu's default; a different one lets both emulators run at once. */
+#define HOSTCMD_DEFAULT_TCP_PORT 15600
+
+/* Configuration, read from the machine's .cfg by config.c. */
+int hostcmd_enabled = 1;
+int hostcmd_port = HOSTCMD_DEFAULT_TCP_PORT;
+
+/* SWI sub-operations, selected in R9 (mirrors the HostFS R9 convention). */
+#define HC_OP_REGISTER	0xffffffffu
+#define HC_OP_POLL	0u
+#define HC_OP_OUTPUT	1u
+#define HC_OP_STATUS	2u
+#define HC_OP_DISPLAY	3u
+
+/* STATUS markers, in R0. */
+#define HC_STATUS_START	0u
+#define HC_STATUS_END	1u
+
+/* Server -> client frame types. */
+#define HC_FRAME_OUTPUT	'O'
+#define HC_FRAME_DONE	'D'
+#define HC_FRAME_NOTICE	'X'
+
+#define HC_PROTOCOL_VERSION	1
+
+/*
+ * How long a queued command waits before the client is told it will not run.
+ *
+ * The two cases are not equally strong, and treating them alike is a mistake in
+ * one direction or the other. "The guest module has never announced itself" is
+ * unambiguous - nothing is there to collect the command, and no amount of
+ * waiting will change that - so a short limit is right. "It announced itself
+ * and has since gone quiet" is not: the module polls from a ticker, and a
+ * machine busy with a redraw, a modal error box or a long SWI can legitimately
+ * stop polling for a while. Holding that case to the same second would report a
+ * working gateway as broken, which is worse than the wait it replaced.
+ */
+#define HC_NO_GUEST_MS		1000	/* never seen: nothing is listening */
+#define HC_GUEST_QUIET_MS	15000	/* seen, then quiet: probably just busy */
+
+#define HC_CMDLINE_MAX	256		/* RISC OS OS_CLI limit is 255 chars + NUL */
+#define HC_IN_BUF_SZ	HC_CMDLINE_MAX
+#define HC_OUT_RING_SZ	(64u * 1024u)	/* MUST be a power of two */
+
+typedef struct {
+	int	initialised;
+	int	listen_fd;		/* -1 = disabled/failed */
+	int	client_fd;		/* -1 = no client */
+	int	is_tcp;
+	char	sock_path[512];		/* AF_UNIX path, for unlink() on teardown */
+
+	/* Inbound: bytes from the client accumulate here until a newline. */
+	char	in_buf[HC_IN_BUF_SZ];
+	size_t	in_len;
+	int	in_overflow;		/* current line too long -> resync at next '\n' */
+
+	/* The single command awaiting the guest. cmd_pending: queued, not yet
+	   delivered; cmd_inflight: delivered, awaiting STATUS END. */
+	int	cmd_pending;
+	int	cmd_inflight;
+	char	cmd_line[HC_CMDLINE_MAX];
+	size_t	cmd_len;
+
+	/* Outbound byte ring: producer = SWI handler, consumer = poll() socket
+	   write. Empty when head == tail; usable capacity is HC_OUT_RING_SZ - 1. */
+	uint8_t	out_ring[HC_OUT_RING_SZ];
+	size_t	out_head;
+	size_t	out_tail;
+
+	/* Set once the guest module has announced itself, so an internal caller
+	   can be told there is nothing listening rather than waiting for a
+	   command that will never be collected. Cleared on reset. */
+	int	guest_registered;
+
+	/* Monotonic milliseconds: when the command now waiting was queued, and
+	   when the guest module was last heard from. An outside client used to
+	   get neither answer nor error when nothing was there to collect its
+	   command, and simply waited out its own timeout. See
+	   hc_expire_pending_command(). */
+	int64_t	cmd_queued_ms;
+	int64_t	guest_seen_ms;
+
+	/*
+	 * Commands handed to the guest that nobody is waiting for any more, because
+	 * the client went away or the caller gave up. The guest still finishes them
+	 * and still reports a status, so that many STATUS ENDs are expected and
+	 * discarded rather than being taken for the current command's.
+	 */
+	int	orphaned;
+
+	/* An internal command: one of ours rather than a client's. It owns the
+	   same cmd_* fields, so the two take turns. */
+	int	internal_active;	/* ours is the command in cmd_* */
+	hostcmd_internal_done_fn internal_done;
+	void	*internal_opaque;
+	char	*internal_out;		/* captured output, grown as it arrives */
+	size_t	internal_out_len;
+	size_t	internal_out_cap;
+	int	internal_out_failed;	/* an allocation failed; report what we have */
+} HostCmdState;
+
+static HostCmdState hc = {
+	.listen_fd = -1,
+	.client_fd = -1,
+};
+
+/* ---- outbound ring helpers ------------------------------------------- */
+
+static size_t
+hc_ring_used(void)
+{
+	return (hc.out_head - hc.out_tail) & (HC_OUT_RING_SZ - 1);
+}
+
+static size_t
+hc_ring_free(void)
+{
+	return (HC_OUT_RING_SZ - 1) - hc_ring_used();
+}
+
+/* Monotonic milliseconds. Wall clock rather than emulated time: how long a
+   client is prepared to wait is a real-world quantity, and a machine that has
+   been paused or is running slowly is exactly when the answer matters. */
+static int64_t
+hc_now_ms(void)
+{
+#ifdef _WIN32
+	return (int64_t) GetTickCount64();
+#else
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
+/* Append len bytes; the caller must have ensured hc_ring_free() >= len. */
+static void
+hc_ring_write(const uint8_t *data, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		hc.out_ring[hc.out_head] = data[i];
+		hc.out_head = (hc.out_head + 1) & (HC_OUT_RING_SZ - 1);
+	}
+}
+
+/* ---- internal command output -------------------------------------------- */
+
+/*
+ * Collect output from an internal command.
+ *
+ * Grown geometrically and capped: a command that prints without end (*Type on a
+ * device, say) must not be able to exhaust memory. Past the cap the output is
+ * truncated and the command still completes, which is more useful than failing.
+ */
+#define HC_INTERNAL_OUT_MAX	(1024u * 1024u)
+
+static void
+hc_internal_capture(const char *data, size_t len)
+{
+	if (!hc.internal_active || hc.internal_out_failed || len == 0) {
+		return;
+	}
+
+	if (hc.internal_out_len + len > HC_INTERNAL_OUT_MAX) {
+		len = (hc.internal_out_len < HC_INTERNAL_OUT_MAX)
+		    ? HC_INTERNAL_OUT_MAX - hc.internal_out_len : 0;
+		if (len == 0) {
+			return;
+		}
+	}
+
+	if (hc.internal_out_len + len > hc.internal_out_cap) {
+		size_t want = hc.internal_out_cap ? hc.internal_out_cap * 2 : 4096;
+		char *bigger;
+
+		while (want < hc.internal_out_len + len) {
+			want *= 2;
+		}
+		bigger = realloc(hc.internal_out, want);
+		if (bigger == NULL) {
+			hc.internal_out_failed = 1;
+			return;
+		}
+		hc.internal_out = bigger;
+		hc.internal_out_cap = want;
+	}
+
+	memcpy(hc.internal_out + hc.internal_out_len, data, len);
+	hc.internal_out_len += len;
+}
+
+/* Finish an internal command: hand the result over, then let go of it. */
+static void
+hc_internal_finish(uint32_t rc)
+{
+	const hostcmd_internal_done_fn done = hc.internal_done;
+	void *opaque = hc.internal_opaque;
+	char *out = hc.internal_out;
+	const size_t len = hc.internal_out_len;
+
+	hc.internal_active = 0;
+	hc.internal_done = NULL;
+	hc.internal_opaque = NULL;
+	hc.internal_out = NULL;
+	hc.internal_out_len = 0;
+	hc.internal_out_cap = 0;
+	hc.internal_out_failed = 0;
+
+	if (done != NULL) {
+		done(rc, (out != NULL) ? out : "", len, opaque);
+	}
+	free(out);
+}
+
+/* Push a complete frame if it fits; drop it otherwise (control frames are
+   tiny and the ring is large, so a drop indicates a stuck client). */
+static void
+hc_push_frame(uint8_t type, const uint8_t *payload, uint32_t len)
+{
+	uint8_t hdr[5];
+
+	if (hc.client_fd < 0) {
+		return;
+	}
+	if (hc_ring_free() < (size_t) len + 5) {
+		rpclog("HostCmd: output ring full, dropping '%c' frame\n", type);
+		return;
+	}
+	hdr[0] = type;
+	hdr[1] = (uint8_t) (len >> 24);
+	hdr[2] = (uint8_t) (len >> 16);
+	hdr[3] = (uint8_t) (len >> 8);
+	hdr[4] = (uint8_t) len;
+	hc_ring_write(hdr, 5);
+	hc_ring_write(payload, len);
+}
+
+static void
+hc_notice(const char *msg)
+{
+	hc_push_frame(HC_FRAME_NOTICE, (const uint8_t *) msg, (uint32_t) strlen(msg));
+}
+
+/* ---- SWI handler ----------------------------------------------------- */
+
+void
+hostcmd(ARMul_State *state)
+{
+	uint32_t op = state->Reg[9];
+
+	switch (op) {
+	case HC_OP_REGISTER:
+		/* Handshake: acknowledge presence and report client state. Also the
+		   only proof that the guest module exists, which is what lets an
+		   internal caller be refused straight away rather than waiting for a
+		   command nothing will collect. */
+		hc.guest_registered = 1;
+		hc.guest_seen_ms = hc_now_ms();
+		state->Reg[0] = 0xffffffffu;
+		state->Reg[1] = (hc.client_fd >= 0) ? 1u : 0u;
+		break;
+
+	case HC_OP_POLL: {
+		/* R0 = guest buffer ptr, R1 = buffer size.
+		   R0 out: 0 none / 1 delivered / 2 buffer too small; R1 out: length. */
+		uint32_t bufptr = state->Reg[0];
+		uint32_t bufsize = state->Reg[1];
+
+		/* The module polls from a ticker, so this is the proof that it is
+		   still running, not merely that it once was. */
+		hc.guest_registered = 1;
+		hc.guest_seen_ms = hc_now_ms();
+
+		if (hc.cmd_pending && !hc.cmd_inflight) {
+			if (hc.cmd_len + 1 > bufsize) {
+				state->Reg[0] = 2;
+				state->Reg[1] = (uint32_t) hc.cmd_len;
+			} else {
+				size_t i;
+
+				for (i = 0; i < hc.cmd_len; i++) {
+					ARMul_StoreByte(state, bufptr + i,
+					    (uint8_t) hc.cmd_line[i]);
+				}
+				ARMul_StoreByte(state, bufptr + hc.cmd_len, 0);
+				hc.cmd_pending = 0;
+				hc.cmd_inflight = 1;
+				state->Reg[0] = 1;
+				state->Reg[1] = (uint32_t) hc.cmd_len;
+			}
+		} else {
+			state->Reg[0] = 0;
+		}
+		break;
+	}
+
+	case HC_OP_OUTPUT: {
+		/* R0 = guest ptr, R1 = length. R0 out: bytes accepted (backpressure). */
+		uint32_t ptr = state->Reg[0];
+		uint32_t len = state->Reg[1];
+		uint32_t accept = 0;
+
+		/* Ours: collect it here. An internal command has no socket to write
+		   to, and the whole point of running one is to read what it said. */
+		if (hc.internal_active) {
+			uint32_t i;
+
+			for (i = 0; i < len; i++) {
+				const char byte = (char) ARMul_LoadByte(state, ptr + i);
+
+				hc_internal_capture(&byte, 1);
+			}
+			state->Reg[0] = len;
+			break;
+		}
+
+		if (hc.client_fd < 0 || (!hc.cmd_inflight && hc.orphaned > 0)) {
+			/* Nobody to send it to, or it belongs to an abandoned command:
+			   discard, but tell the guest it all went so it never stalls
+			   waiting to flush. */
+			state->Reg[0] = len;
+			break;
+		}
+
+		{
+			size_t freeb = hc_ring_free();
+
+			if (freeb > 5) {
+				uint32_t canpay = (uint32_t) (freeb - 5);
+
+				accept = (len < canpay) ? len : canpay;
+			}
+		}
+		if (accept > 0) {
+			uint8_t hdr[5];
+			uint32_t i;
+
+			hdr[0] = HC_FRAME_OUTPUT;
+			hdr[1] = (uint8_t) (accept >> 24);
+			hdr[2] = (uint8_t) (accept >> 16);
+			hdr[3] = (uint8_t) (accept >> 8);
+			hdr[4] = (uint8_t) accept;
+			hc_ring_write(hdr, 5);
+			for (i = 0; i < accept; i++) {
+				hc.out_ring[hc.out_head] =
+				    (uint8_t) ARMul_LoadByte(state, ptr + i);
+				hc.out_head = (hc.out_head + 1) & (HC_OUT_RING_SZ - 1);
+			}
+		}
+		state->Reg[0] = accept;
+		break;
+	}
+
+	case HC_OP_STATUS: {
+		/* R0 = marker (START/END), R1 = return code, R2 = flags (bit0 truncated). */
+		uint32_t marker = state->Reg[0];
+
+		if (marker == HC_STATUS_END && !hc.cmd_inflight && hc.orphaned > 0) {
+			/* An abandoned command reporting in. Not the current one's status,
+			   so it must not close it or reach a client. */
+			hc.orphaned--;
+			rpclog("HostCmd: discarded the status of an abandoned command "
+			       "(%d still outstanding)\n", hc.orphaned);
+			state->Reg[0] = 0;
+			break;
+		}
+
+		if (marker == HC_STATUS_END && hc.internal_active) {
+			hc.cmd_inflight = 0;
+			hc_internal_finish(state->Reg[1]);
+			state->Reg[0] = 0;
+			break;
+		}
+
+		if (marker == HC_STATUS_END) {
+			uint32_t rc = state->Reg[1];
+			uint8_t rcbuf[4];
+
+			rcbuf[0] = (uint8_t) (rc >> 24);
+			rcbuf[1] = (uint8_t) (rc >> 16);
+			rcbuf[2] = (uint8_t) (rc >> 8);
+			rcbuf[3] = (uint8_t) rc;
+			hc_push_frame(HC_FRAME_DONE, rcbuf, 4);
+			hc.cmd_inflight = 0;
+		}
+		/* START needs no frame: the 'O'/'D' framing already delimits output. */
+		state->Reg[0] = 0;
+		break;
+	}
+
+	case HC_OP_DISPLAY: {
+		/* Report the display mode the guest should adopt to follow the host.
+		   R0 out: 1 if a mode is being reported, else 0.
+		   R1 out: generation - changes when the host display changes, so the
+		           module compares it against the one it last acted on rather
+		           than us having to track what it has seen.
+		   R2/R3 out: width and height, already bounded by the host display and
+		           by VRAM, so the guest can use them as they stand.
+		   R4 out: refresh in Hz, 0 if the front-end did not supply one. */
+		/* Arculator does not ask the guest to follow the host display. */
+		state->Reg[0] = 0;
+		state->Reg[1] = 0;
+		state->Reg[2] = 0;
+		state->Reg[3] = 0;
+		state->Reg[4] = 0;
+		break;
+	}
+
+	default:
+		/* R0 = 0 so a guest module asking about something this build does not
+		   implement reads a definite "no" rather than whatever it passed in. */
+		state->Reg[0] = 0;
+		rpclog("HostCmd: unknown SWI op 0x%08x\n", op);
+		break;
+	}
+}
+
+/* ---- socket lifecycle ------------------------------------------------ */
+
+static void
+hc_set_nonblock(int fd)
+{
+	socket_set_nonblocking(fd);
+}
+
+#if 0 /* AF_UNIX transport not used by Arculator */
+static int
+hc_listen_unix(const char *path)
+{
+	struct sockaddr_un addr;
+	int fd;
+
+	if (strlen(path) >= sizeof(addr.sun_path)) {
+		rpclog("HostCmd: socket path too long: %s\n", path);
+		return -1;
+	}
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) {
+		rpclog("HostCmd: socket() failed: %s\n", strerror(errno));
+		return -1;
+	}
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	/* The length was checked above, so this fits with room for the
+	   terminator the memset already put there. memcpy rather than strncpy
+	   because the bound strncpy is given is the destination's size, which
+	   GCC cannot relate to the check and so warns about truncating a path
+	   that has already been refused. */
+	memcpy(addr.sun_path, path, strlen(path));
+	unlink(path);	/* clear a stale socket left by a previous crash */
+	if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+		rpclog("HostCmd: bind(%s) failed: %s\n", path, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	if (listen(fd, 1) < 0) {
+		rpclog("HostCmd: listen() failed: %s\n", strerror(errno));
+		close(fd);
+		unlink(path);
+		return -1;
+	}
+	hc_set_nonblock(fd);
+	strncpy(hc.sock_path, path, sizeof(hc.sock_path) - 1);
+	hc.sock_path[sizeof(hc.sock_path) - 1] = '\0';
+	hc.is_tcp = 0;
+	rpclog("HostCmd: listening on AF_UNIX %s\n", path);
+	return fd;
+}
+#endif /* AF_UNIX */
+
+static int
+hc_listen_tcp(int port)
+{
+	struct sockaddr_in addr;
+	int fd;
+	int on = 1;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		rpclog("HostCmd: socket() failed: %s\n", strerror(errno));
+		return -1;
+	}
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *) &on, sizeof(on));
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);	/* local only */
+	addr.sin_port = htons((uint16_t) port);
+	if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+		rpclog("HostCmd: bind(127.0.0.1:%d) failed: %s\n", port, strerror(errno));
+		closesocket(fd);
+		return -1;
+	}
+	if (listen(fd, 1) < 0) {
+		rpclog("HostCmd: listen() failed: %s\n", strerror(errno));
+		closesocket(fd);
+		return -1;
+	}
+	hc_set_nonblock(fd);
+	hc.is_tcp = 1;
+	hc.sock_path[0] = '\0';
+	rpclog("HostCmd: listening on TCP 127.0.0.1:%d\n", port);
+	return fd;
+}
+
+/*
+ * Bind the first free port at or above `first`. See the note at the Windows
+ * caller for why a machine may not get the port its configuration names.
+ */
+static int
+hc_listen_tcp_from(int first)
+{
+	const int attempts = 16;
+	int i;
+
+	for (i = 0; i < attempts; i++) {
+		const int port = first + i;
+		int fd;
+
+		if (port < 1 || port > 65535) {
+			break;
+		}
+		fd = hc_listen_tcp(port);
+		if (fd >= 0) {
+			if (i > 0) {
+				rpclog("HostCmd: TCP port %d was in use, listening on %d "
+				       "instead\n", first, port);
+			}
+			return fd;
+		}
+	}
+	return -1;
+}
+
+/* Record the port actually bound, so a tool does not have to guess it. */
+static void
+hc_record_tcp_endpoint(void)
+{
+	char endpoint[64];
+	struct sockaddr_in addr;
+	socklen_t len = sizeof(addr);
+
+	if (hc.listen_fd < 0) {
+		return;
+	}
+	if (getsockname(hc.listen_fd, (struct sockaddr *) &addr, &len) != 0) {
+		return;
+	}
+	snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u",
+	    (unsigned) ntohs(addr.sin_port));
+	hostcmd_port = ntohs(addr.sin_port);
+	rpclog("HostCmd: endpoint %s\n", endpoint);
+}
+
+void
+hostcmd_init(void)
+{
+	/* Idempotent: tear down any previous listener (e.g. machine switch). */
+	if (hc.initialised) {
+		hostcmd_close();
+	}
+
+	memset(&hc, 0, sizeof(hc));
+	hc.listen_fd = -1;
+	hc.client_fd = -1;
+	hc.initialised = 1;
+
+	if (!hostcmd_enabled) {
+		return;
+	}
+
+#ifdef _WIN32
+	{
+		WSADATA wsa;
+
+		if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+			rpclog("HostCmd: WSAStartup failed\n");
+			return;
+		}
+	}
+#endif
+
+	/*
+	 * TCP loopback everywhere. Every machine configuration carries the same
+	 * default port, so when it is taken (another Arculator, or RPCEmu on its
+	 * own default) the next free one is bound and logged; hostcmd_port is
+	 * updated to what was actually bound.
+	 */
+	{
+		int port = hostcmd_port;
+
+		if (port < 1 || port > 65535) {
+			port = HOSTCMD_DEFAULT_TCP_PORT;
+		}
+		hc.listen_fd = hc_listen_tcp_from(port);
+		hc_record_tcp_endpoint();
+	}
+}
+
+static void
+hc_drop_client(void)
+{
+	if (hc.client_fd >= 0) {
+		closesocket(hc.client_fd);
+		hc.client_fd = -1;
+	}
+	hc.in_len = 0;
+	hc.in_overflow = 0;
+	hc.out_head = hc.out_tail = 0;	/* discard undelivered output */
+	hc.cmd_pending = 0;		/* nobody to serve an undelivered command */
+
+	/*
+	 * The guest module is unaffected by a client coming and going, so its
+	 * registration stands. Clearing it here was a mistake: it would have left
+	 * the emulator's own commands refused after anyone used rpcemu-run, since
+	 * the module only announces itself when it starts.
+	 *
+	 * A command already delivered is orphaned rather than waited for. Nobody is
+	 * left to receive its result, and holding cmd_inflight for it would stop the
+	 * next client's command being read - the channel wedged until the guest
+	 * happened to finish.
+	 */
+	if (hc.cmd_inflight && !hc.internal_active) {
+		hc.cmd_inflight = 0;
+		hc.orphaned++;
+	}
+}
+
+void
+hostcmd_reset(void)
+{
+	if (!hc.initialised) {
+		return;
+	}
+	/* Machine reset: end any in-flight command cleanly for the client. */
+	if (hc.client_fd >= 0 && hc.cmd_inflight) {
+		uint8_t rc[4] = { 0xff, 0xff, 0xff, 0xff };
+
+		hc_notice("machine reset\n");
+		hc_push_frame(HC_FRAME_DONE, rc, 4);
+	}
+	hc.cmd_pending = 0;
+	hc.cmd_inflight = 0;
+	hc.cmd_len = 0;
+	hc.orphaned = 0;		/* nothing outstanding can now report back */
+
+	/* The module goes with the machine and will announce itself again. */
+	hc.guest_registered = 0;
+
+	if (hc.internal_active) {
+		/* Reset underneath it, so it will never finish. Tell the caller rather
+		   than leaving them waiting for a reply that cannot come. */
+		hc.internal_done = NULL;
+		hc_internal_finish(0);
+	}
+	/* Listener and client persist across a guest reboot. */
+}
+
+void
+hostcmd_close(void)
+{
+	if (hc.client_fd >= 0) {
+		closesocket(hc.client_fd);
+		hc.client_fd = -1;
+	}
+	if (hc.listen_fd >= 0) {
+		closesocket(hc.listen_fd);
+		hc.listen_fd = -1;
+	}
+#ifndef _WIN32
+	if (!hc.is_tcp && hc.sock_path[0] != '\0') {
+		unlink(hc.sock_path);
+		hc.sock_path[0] = '\0';
+	}
+#endif
+	hc.initialised = 0;
+#ifdef _WIN32
+	if (hostcmd_enabled) {
+		WSACleanup();
+	}
+#endif
+}
+
+/* ---- per-tick service ------------------------------------------------ */
+
+static void
+hc_read_client(void)
+{
+	uint8_t tmp[4096];
+	ssize_t n;
+	ssize_t i;
+
+	n = recv(hc.client_fd, (char *) tmp, sizeof(tmp), 0);
+	if (n == 0) {
+		hc_drop_client();
+		return;
+	}
+	if (n < 0) {
+		if (sock_errno() == SOCK_EWOULDBLOCK || sock_errno() == SOCK_EAGAIN) {
+			return;
+		}
+		hc_drop_client();
+		return;
+	}
+
+	for (i = 0; i < n; i++) {
+		uint8_t b = tmp[i];
+
+		if (hc.in_overflow) {
+			if (b == '\n') {
+				hc.in_overflow = 0;
+				hc_notice("command too long, ignored\n");
+			}
+			continue;
+		}
+		if (b == '\n') {
+			size_t copy = hc.in_len;
+
+			hc.in_len = 0;
+			if (copy > 0 && hc.in_buf[copy - 1] == '\r') {
+				copy--;
+			}
+			if (copy == 0) {
+				continue;	/* blank line: nothing to run */
+			}
+			if (hc.cmd_pending || hc.cmd_inflight) {
+				/* Interactive model is one command at a time; a client
+				   should wait for 'D' before sending the next line. */
+				hc_notice("busy, command dropped\n");
+				continue;
+			}
+			memcpy(hc.cmd_line, hc.in_buf, copy);
+			hc.cmd_line[copy] = '\0';
+			hc.cmd_len = copy;
+			hc.cmd_pending = 1;
+			hc.cmd_queued_ms = hc_now_ms();
+			continue;
+		}
+		if (hc.in_len < HC_CMDLINE_MAX - 1) {
+			hc.in_buf[hc.in_len++] = (char) b;
+		} else {
+			hc.in_overflow = 1;
+			hc.in_len = 0;
+		}
+	}
+}
+
+static void
+hc_write_client(void)
+{
+	while (hc_ring_used() > 0) {
+		size_t used = hc_ring_used();
+		size_t to_end = HC_OUT_RING_SZ - hc.out_tail;
+		size_t contig = (used < to_end) ? used : to_end;
+		ssize_t n = send(hc.client_fd, (const char *) &hc.out_ring[hc.out_tail], contig,
+		    MSG_NOSIGNAL);
+
+		if (n < 0) {
+			if (sock_errno() == SOCK_EWOULDBLOCK || sock_errno() == SOCK_EAGAIN) {
+				return;
+			}
+			hc_drop_client();
+			return;
+		}
+		if (n == 0) {
+			return;
+		}
+		hc.out_tail = (hc.out_tail + (size_t) n) & (HC_OUT_RING_SZ - 1);
+	}
+}
+
+/* ---- running a command from inside the emulator -------------------------- */
+
+int
+hostcmd_internal_ready(void)
+{
+	return hc.initialised && hc.guest_registered;
+}
+
+int
+hostcmd_internal_busy(void)
+{
+	return hc.internal_active;
+}
+
+int
+hostcmd_internal_submit(const char *command, hostcmd_internal_done_fn done,
+    void *opaque)
+{
+	size_t len;
+
+	if (command == NULL) {
+		return -1;
+	}
+	len = strlen(command);
+	if (len == 0 || len + 1 > HC_CMDLINE_MAX) {
+		rpclog("HostCmd: internal command rejected (%zu bytes)\n", len);
+		return -1;
+	}
+	if (!hostcmd_internal_ready()) {
+		rpclog("HostCmd: internal command refused, the guest module has not "
+		       "announced itself\n");
+		return -1;
+	}
+	/* One command at a time, shared with any outside client: taking turns is
+	   simpler to reason about than interleaving two conversations, and an
+	   internal caller can retry. */
+	if (hc.internal_active || hc.cmd_pending || hc.cmd_inflight) {
+		return -1;
+	}
+
+	memcpy(hc.cmd_line, command, len);
+	hc.cmd_line[len] = '\0';
+	hc.cmd_len = len;
+	hc.cmd_pending = 1;
+	hc.cmd_queued_ms = hc_now_ms();
+	hc.cmd_inflight = 0;
+
+	hc.internal_active = 1;
+	hc.internal_done = done;
+	hc.internal_opaque = opaque;
+	hc.internal_out = NULL;
+	hc.internal_out_len = 0;
+	hc.internal_out_cap = 0;
+	hc.internal_out_failed = 0;
+
+	rpclog("HostCmd: internal command queued: %s\n", hc.cmd_line);
+	return 0;
+}
+
+void
+hostcmd_internal_abandon(void)
+{
+	if (!hc.internal_active) {
+		return;
+	}
+
+	/* Drop the callback first, so finishing cannot call back into a caller
+	   that has given up on us. */
+	hc.internal_done = NULL;
+	if (hc.cmd_pending) {
+		hc.cmd_pending = 0;	/* never delivered: nothing to wait for */
+		hc.cmd_len = 0;
+	} else if (hc.cmd_inflight) {
+		/*
+		 * Already with the guest. It finishes in its own time, but the channel
+		 * is handed back now: leaving cmd_inflight set would stop any later
+		 * command being read, which is a stuck channel for everyone rather than
+		 * one abandoned request.
+		 *
+		 * Safe because the guest asks for work only between commands, so a
+		 * command accepted now cannot be delivered until this one has finished.
+		 */
+		hc.cmd_inflight = 0;
+		hc.orphaned++;
+	}
+	hc_internal_finish(0);
+}
+
+/*
+ * Give up on a command nothing is going to collect.
+ *
+ * A command sits in cmd_pending until the guest module polls for it. If no
+ * module is running - the machine is still booting, its !Boot never loads one,
+ * or its HostFS disc is empty - that poll never comes, and the command used to
+ * wait there in silence while the client wore out its own timeout with no idea
+ * whether the command had run. The guest's silence is the signal; this turns it
+ * into an answer.
+ *
+ * The two limits differ deliberately: see HC_NO_GUEST_MS above.
+ */
+static void
+hc_expire_pending_command(void)
+{
+	int64_t waited;
+	const char *why;
+
+	if (!hc.cmd_pending || hc.cmd_inflight) {
+		return;		/* nothing waiting, or already with the guest */
+	}
+
+	waited = hc_now_ms() - hc.cmd_queued_ms;
+
+	if (!hc.guest_registered) {
+		if (waited < HC_NO_GUEST_MS) {
+			return;
+		}
+		why = "no guest module has collected a command: it is not running, "
+		      "or the machine has not finished booting";
+	} else {
+		if (hc_now_ms() - hc.guest_seen_ms < HC_GUEST_QUIET_MS) {
+			return;
+		}
+		why = "the guest module has stopped polling: the machine may be "
+		      "paused, or stuck in an error box";
+	}
+
+	rpclog("HostCmd: giving up on '%s' after %d ms - %s\n",
+	       hc.cmd_line, (int) waited, why);
+
+	hc.cmd_pending = 0;
+	hc.cmd_len = 0;
+
+	if (hc.internal_active) {
+		hc_internal_finish(0xffffffffu);
+		return;
+	}
+
+	if (hc.client_fd >= 0) {
+		uint8_t rc[4] = { 0xff, 0xff, 0xff, 0xff };
+		char msg[256];
+
+		snprintf(msg, sizeof(msg), "Arculator: %s\n", why);
+		hc_notice(msg);
+		hc_push_frame(HC_FRAME_DONE, rc, 4);
+	}
+}
+
+void
+hostcmd_poll(void)
+{
+	struct pollfd pfd;
+
+	if (hc.listen_fd < 0) {
+		return;
+	}
+
+	hc_expire_pending_command();
+
+	if (hc.client_fd < 0) {
+		/*
+		 * Nothing connected, which is the ordinary case. This function is called
+		 * every 20000 emulated cycles - tens of thousands of times a second -
+		 * and asking the kernel whether anybody has connected costs a syscall
+		 * every time. That was most of the cost of a feature nobody was using.
+		 *
+		 * Only this branch is throttled. A client waiting to connect can wait a
+		 * few milliseconds; data on an open connection cannot, so the path below
+		 * is unchanged. Sixty-four calls is about 3ms of guest time at full
+		 * speed, and about 75ms while the machine idles under "Reduce CPU
+		 * usage", where this is called from the idle loop instead.
+		 */
+		static unsigned since_listen_check;
+
+		if ((++since_listen_check & 0x3fu) != 0) {
+			return;
+		}
+
+		pfd.fd = hc.listen_fd;
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+		if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+			int c = accept(hc.listen_fd, NULL, NULL);
+
+			if (c >= 0) {
+				char greeting[320];	/* over the 288 a full name needs */
+
+				hc_set_nonblock(c);
+				hc.client_fd = c;
+				hc.in_len = 0;
+				hc.in_overflow = 0;
+				hc.out_head = hc.out_tail = 0;
+				snprintf(greeting, sizeof(greeting),
+				    "Arculator HostCmd v1 (running on %s)\n", machine_config_name);
+				hc_notice(greeting);
+			}
+		}
+		return;
+	}
+
+	pfd.fd = hc.client_fd;
+	pfd.events = 0;
+	pfd.revents = 0;
+	/* Only read a new command while idle: this preserves command order and
+	   back-pressures a client that types ahead (its bytes wait in the kernel
+	   socket buffer until we finish the current command). */
+	if (!hc.cmd_pending && !hc.cmd_inflight) {
+		pfd.events |= POLLIN;
+	}
+	if (hc_ring_used() > 0) {
+		pfd.events |= POLLOUT;
+	}
+	if (pfd.events == 0) {
+		return;
+	}
+	if (poll(&pfd, 1, 0) <= 0) {
+		return;
+	}
+	if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+		hc_drop_client();
+		return;
+	}
+	if (pfd.revents & POLLIN) {
+		hc_read_client();
+		if (hc.client_fd < 0) {
+			return;
+		}
+	}
+	if (pfd.revents & POLLOUT) {
+		hc_write_client();
+	}
+}

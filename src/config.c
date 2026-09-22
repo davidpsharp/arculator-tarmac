@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "arc.h"
+#include "hostcmd.h"
 #include "arm.h"
 #include "config.h"
 #include "disc.h"
@@ -712,6 +713,8 @@ void loadconfig()
 	sound_gain = config_get_int(CFG_GLOBAL, NULL, "sound_gain", 0);
 	sound_filter = config_get_int(CFG_GLOBAL, NULL, "sound_filter", 0);
 	disc_noise_gain = config_get_int(CFG_GLOBAL, NULL, "disc_noise_gain", 0);
+	hostcmd_enabled = config_get_int(CFG_MACHINE, NULL, "hostcmd_enabled", 1);
+	hostcmd_port = config_get_int(CFG_MACHINE, NULL, "hostcmd_port", 15600);
 	unique_id = config_get_int(CFG_MACHINE, NULL, "unique_id", 0);
 	memsize = config_get_int(CFG_MACHINE, NULL, "mem_size", 4096);
 	p = (char *)config_get_string(CFG_MACHINE, NULL, "rom_set", "riscos311");
@@ -885,6 +888,8 @@ void saveconfig()
 	config_set_int(CFG_GLOBAL, NULL, "sound_gain", sound_gain);
 	config_set_int(CFG_GLOBAL, NULL, "sound_filter", sound_filter);
 	config_set_int(CFG_GLOBAL, NULL, "disc_noise_gain", disc_noise_gain);
+	config_set_int(CFG_MACHINE, NULL, "hostcmd_enabled", hostcmd_enabled);
+	config_set_int(CFG_MACHINE, NULL, "hostcmd_port", hostcmd_port);
 	config_set_int(CFG_MACHINE, NULL, "unique_id", unique_id);
 	config_set_string(CFG_MACHINE, NULL, "hd4_fn", hd_fn[0]);
 	config_set_int(CFG_MACHINE, NULL, "hd4_sectors", hd_spt[0]);

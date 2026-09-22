@@ -46,6 +46,7 @@
 #include "wd1770.h"
 
 #include "hostfs.h"
+#include "hostcmd.h"
 
 /*0=Arthur
   1=RiscOS 2
@@ -163,6 +164,7 @@ int arc_init()
 	initarculfs();
 #endif
 	hostfs_init();
+	hostcmd_init();
 	initmem(memsize);
 
 	if (loadrom())
@@ -174,6 +176,7 @@ int arc_init()
 
 	initmemc();
 	resetarm();
+	hostcmd_reset();
 	cmos_load();
 	ioc_reset();
 	vidc_reset();
@@ -247,6 +250,7 @@ void arc_reset()
 	resizemem(memsize);
 	initmemc();
 	resetarm();
+	hostcmd_reset();
 	memset(ram,0,memsize*1024);
 	resetmouse();
 	ioc_reset();
@@ -332,6 +336,7 @@ void arc_run()
 	keyboard_poll_host();
 	if (mousehack) doosmouse();
 	execarm((speed_mhz * 1000000) / 100);
+	hostcmd_poll();
 	frameco++;
 	ddnoise_frames++;
 	if (ddnoise_frames == 10)
@@ -356,6 +361,7 @@ void arc_close()
 	dumpregs();
 	cmos_save();
 	saveconfig();
+	hostcmd_close();
 	podules_close();
 	disc_close(0);
 	disc_close(1);
