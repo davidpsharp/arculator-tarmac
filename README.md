@@ -1,8 +1,28 @@
-# Arculator
+# Arculator (arculator-tarmac fork)
 
 Arculator is an Acorn Archimedes emulator originally written by [Sarah Walker](https://github.com/sarah-walker-pcem). It emulates the Acorn Archimedes series of computers, including models like the A3000, A3010, A3020, A4000, A5000, and more.
 
-⚠️ **This is a fork of the original project but using CMake instead of automake to assist with cross-platform development. <u>It is currently heavily in progress!</u>** ⚠️
+This is David Sharp's fork, made to host the **Tarmac** ARM2/ARM3 CPU core
+(written in 2001 as a final-year project and revived in 2026) as a selectable
+replacement for Arculator's own, so it can be released and tested inside a
+complete, redistributable emulator. It builds on
+[jankfactor's CMake fork](https://github.com/jankfactor/arculator) for the
+CMake build system and macOS support, and tracks Sarah Walker's upstream.
+
+What differs from upstream so far (branch `tarmac`):
+
+- **HostCmd** — run RISC OS `*commands` from the host over a local socket and
+  read back their output and return code; ported from RPCEmu-extended. See
+  [docs/HOSTCMD.md](docs/HOSTCMD.md).
+- `tools/arc-run.pl` (HostCmd client), `tools/armtest.ps1` (runs the
+  `!ARMTest` ARM instruction-set soak test end to end and reports the FAIL
+  count), `tools/mkextrom.pl` (rebuilds `roms/arcrom_ext`).
+- The RPCEmuSupport guest module added to the Arculator support extension ROM.
+
+The Tarmac core itself is not in yet. This fork is developed with AI
+assistance and is not intended for submission upstream.
+
+⚠️ **The CMake build system comes from jankfactor's fork and is still settling.** ⚠️
 
 ## Building
 
