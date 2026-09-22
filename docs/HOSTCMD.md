@@ -56,6 +56,11 @@ powershell -ExecutionPolicy Bypass -File tools\armtest.ps1 -RunDir C:\arculator-
   reset, or the module stopped polling for 15 s), 254 if the emulator could
   not be reached. `--wait` blocks until the port answers, for scripts that
   have just launched the emulator.
+- While the F12 command line is open on the emulated screen the desktop is
+  suspended and so is the module's TaskWindow path; a queued command waits
+  until Return closes the prompt (the client sees only its own timeout). To
+  type *commands by hand while HostCmd is in use, open a multitasking Task
+  Window instead: Ctrl+F12, or "Task window" from the Acorn icon's menu.
 - No stdin: commands that prompt will hang until the client's timeout. Use
   `BASIC -quit <file>`, `Obey` files, etc.
 - Commands that need an application slot (`WimpSlot`, `BASIC`) work once the
