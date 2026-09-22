@@ -30,6 +30,7 @@ set(ARCULATOR_SOURCES
     hostfs.c
     hostcmd.c
     debugsock.c
+    arm_timing.c
     ide.c
     ide_a3in.c
     ide_config.c
